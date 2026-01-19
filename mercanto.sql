@@ -1,5 +1,5 @@
 --
--- File generated with SQLiteStudio v3.4.20 on Do Jan 15 22:19:50 2026
+-- File generated with SQLiteStudio v3.4.20 on Mo Jan 19 12:44:34 2026
 --
 -- Text encoding used: System
 --
@@ -142,6 +142,197 @@ CREATE TABLE IF NOT EXISTS Produkt (
     Verfallsdatum TEXT (10),
     Lagerbestand  REAL       NOT NULL
 );
+
+
+-- View: vw_Bestellposition_Detail
+DROP VIEW IF EXISTS vw_Bestellposition_Detail;
+CREATE VIEW IF NOT EXISTS vw_Bestellposition_Detail AS
+    SELECT bp.PositionID,
+           bp.BestellungID,
+           bp.ProduktID,
+           p.Bezeichnug AS Produktname,
+           p.EAN,
+           bp.Menge,
+           bp.Einzelpreis,
+           bp.Gesamtpreis,
+           bp.Rabatt,
+           bp.MwSt
+      FROM Bestellposition bp
+           LEFT JOIN
+           Produkt p ON p.ProduktID = bp.ProduktID;
+
+
+-- View: vw_Bestellung_Uebersicht
+DROP VIEW IF EXISTS vw_Bestellung_Uebersicht;
+CREATE VIEW IF NOT EXISTS vw_Bestellung_Uebersicht AS
+    SELECT b.BestellungID,
+           b.Datum,
+           b.Lieferdatum,
+           b.Status,
+           b.Gesamtbetrag,
+           k.KundenID,
+           k.Vorname || ' ' || k.Nachname AS Kunde,
+           m.MitarbeiterID,
+           m.Vorname || ' ' || m.Nachname AS Mitarbeiter,
+           (
+               SELECT COUNT( * ) 
+                 FROM Bestellposition bp
+                WHERE bp.BestellungID = b.BestellungID
+           )
+           AS PositionenAnzahl
+      FROM Bestellung b
+           LEFT JOIN
+           Kunden k ON k.KundenID = b.KundenID
+           LEFT JOIN
+           Mitarbeiter m ON m.MitarbeiterID = b.MitarbeiterID;
+
+
+-- View: vw_Kunden_Adressen
+DROP VIEW IF EXISTS vw_Kunden_Adressen;
+CREATE VIEW IF NOT EXISTS vw_Kunden_Adressen AS
+    SELECT a.AdressID,
+           a.KundeID,
+           k.Vorname || ' ' || k.Nachname AS Kunde,
+           a.Strasse || ' ' || a.Hausnummer AS Strasse,
+           a.PLZ,
+           a.Stadt,
+           a.Land,
+           a.Typ
+      FROM Adresse a
+           LEFT JOIN
+           Kunden k ON k.KundenID = a.KundeID;
+
+
+-- View: vw_Kunden_Bestellhistorie
+DROP VIEW IF EXISTS vw_Kunden_Bestellhistorie;
+CREATE VIEW IF NOT EXISTS vw_Kunden_Bestellhistorie AS
+    SELECT k.KundenID,
+           k.Vorname || ' ' || k.Nachname AS Kunde,
+           COUNT(b.BestellungID) AS AnzahlBestellungen,
+           IFNULL(SUM(b.Gesamtbetrag), 0) AS SummeBestellungen,
+           MAX(b.Datum) AS LetzteBestellung
+      FROM Kunden k
+           LEFT JOIN
+           Bestellung b ON b.KundenID = k.KundenID
+     GROUP BY k.KundenID;
+
+
+-- View: vw_Produkt_Details
+DROP VIEW IF EXISTS vw_Produkt_Details;
+CREATE VIEW IF NOT EXISTS vw_Produkt_Details AS
+    SELECT p.ProduktID,
+           p.Bezeichnug,
+           p.EAN,
+           p.Preis,
+           p.Gewicht,
+           p.Verfallsdatum,
+           p.Lagerbestand,
+           l.LieferantID,
+           l.Name AS Lieferant,
+           c.kategorieID,
+           c.titel AS Kategorie
+      FROM Produkt p
+           LEFT JOIN
+           Lieferant l ON l.LieferantID = p.LieferantID
+           LEFT JOIN
+           Kategorie c ON c.kategorieID = p.KategorieID;
+
+
+-- View: vw_Produkt_LowStock
+DROP VIEW IF EXISTS vw_Produkt_LowStock;
+CREATE VIEW IF NOT EXISTS vw_Produkt_LowStock AS
+    SELECT ProduktID,
+           Bezeichnug,
+           Lagerbestand
+      FROM Produkt
+     WHERE Lagerbestand <= 5;
+
+
+-- Trigger: trg_bestellung_after_status_versendet
+DROP TRIGGER IF EXISTS trg_bestellung_after_status_versendet;
+CREATE TRIGGER IF NOT EXISTS trg_bestellung_after_status_versendet
+                       AFTER UPDATE OF Status
+                          ON Bestellung
+                        WHEN NEW.Status = 'Versendet' AND
+                             (OLD.Status IS NULL OR
+                              OLD.Status != 'Versendet') 
+BEGIN-- Für jedes Produkt in der Bestellung die Summe der Menge abziehen
+    UPDATE Produkt
+       SET Lagerbestand = Lagerbestand - (
+                                             SELECT IFNULL(SUM(bp.Menge), 0) 
+                                               FROM Bestellposition bp
+                                              WHERE bp.ProduktID = Produkt.ProduktID AND
+                                                    bp.BestellungID = NEW.BestellungID
+                                         )
+     WHERE EXISTS (
+        SELECT 1
+          FROM Bestellposition bp
+         WHERE bp.ProduktID = Produkt.ProduktID AND
+               bp.BestellungID = NEW.BestellungID
+    );
+END;
+
+
+-- Trigger: trg_bp_after_insert
+DROP TRIGGER IF EXISTS trg_bp_after_insert;
+CREATE TRIGGER IF NOT EXISTS trg_bp_after_insert
+                       AFTER INSERT
+                          ON Bestellposition
+BEGIN
+    UPDATE Bestellung
+       SET Gesamtbetrag = (
+               SELECT IFNULL(SUM(Gesamtpreis * (1.0 - Rabatt / 100.0) ), 0) 
+                 FROM Bestellposition
+                WHERE BestellungID = NEW.BestellungID
+           )
+     WHERE BestellungID = NEW.BestellungID;
+END;
+
+
+-- Trigger: trg_bp_after_insert_set_price
+DROP TRIGGER IF EXISTS trg_bp_after_insert_set_price;
+CREATE TRIGGER IF NOT EXISTS trg_bp_after_insert_set_price
+                       AFTER INSERT
+                          ON Bestellposition
+                        WHEN NEW.Einzelpreis IS NULL OR
+                             NEW.Einzelpreis = 0
+BEGIN
+    UPDATE Bestellposition
+       SET Einzelpreis = (
+               SELECT Preis
+                 FROM Produkt
+                WHERE ProduktID = NEW.ProduktID
+           )
+     WHERE PositionID = NEW.PositionID;
+END;
+
+
+-- Trigger: trg_bp_before_insert_validate_menge
+DROP TRIGGER IF EXISTS trg_bp_before_insert_validate_menge;
+CREATE TRIGGER IF NOT EXISTS trg_bp_before_insert_validate_menge
+                      BEFORE INSERT
+                          ON Bestellposition
+                        WHEN NEW.Menge <= 0
+BEGIN
+    SELECT RAISE(ABORT, 'Menge muss grösser als 0 sein');
+END;
+
+
+-- Trigger: trg_check_negative_stock_after_versand
+DROP TRIGGER IF EXISTS trg_check_negative_stock_after_versand;
+CREATE TRIGGER IF NOT EXISTS trg_check_negative_stock_after_versand
+                       AFTER UPDATE OF Status
+                          ON Bestellung
+                        WHEN NEW.Status = 'Versendet'
+BEGIN-- Falls irgendein Produkt negativen Lagerbestand hat, Abbruch erzwingen
+    SELECT CASE
+               WHEN (
+                        SELECT MIN(Lagerbestand) 
+                          FROM Produkt
+                    )
+<              0 THEN RAISE(ABORT, 'Versand nicht möglich: Negativer Lagerbestand nach Anpassung') 
+           END;
+END;
 
 
 COMMIT TRANSACTION;
